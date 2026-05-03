@@ -39,15 +39,15 @@ pip install -r requirements.txt
 ### 2. 运行分析
 
 ```bash
-python main.py 600737
+python stock_full_report.py 000066
 ```
 
 ### 3. 查看报告
 
 生成的报告位于 `output/` 目录：
-- `个股研究-中粮糖业.md` - Markdown分析报告
-- `个股研究-中粮糖业.html` - HTML可视化报告
-- `data_600737.json` - 原始数据
+- `个股研究-中国长城.md` - Markdown分析报告
+- `个股研究-中国长城.html` - HTML可视化报告
+- `data_000066.json` - 原始数据
 
 ---
 
