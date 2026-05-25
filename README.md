@@ -30,6 +30,27 @@
 
 ## 🚀 快速开始
 
+### 方式零：网页端（直接渲染 HTML 报告）
+
+在浏览器中输入股票代码，自动生成并展示完整 HTML 研报：
+
+```bash
+pip install -r requirements.txt
+./run_web.sh
+# 或: uvicorn web.app:app --host 0.0.0.0 --port 8000 --reload
+```
+
+打开 http://localhost:8000 ，输入代码（如 `600519`）即可。首次生成约 2–5 分钟；1 小时内同一股票会使用缓存。
+
+| 路径 | 说明 |
+|------|------|
+| `/` | 首页，输入代码 |
+| `/report/{代码}` | 生成中（进度页） |
+| `/view/{代码}` | 直接查看 HTML 报告 |
+| `/examples/demo` | 示例深度研报（中国长城） |
+
+---
+
 ### 方式一：作为 Claude Code Skill 调用（推荐）
 
 **直接对话触发：**

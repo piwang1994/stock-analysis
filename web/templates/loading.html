@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>正在生成 {{ code }} 报告…</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="page-loading">
+  <main class="shell loading-shell">
+    <div class="spinner" aria-hidden="true"></div>
+    <h1>正在生成报告</h1>
+    <p class="code-badge">{{ code }}</p>
+    <p class="status-msg" id="statusMsg">排队中…</p>
+    <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+    <p class="hint">数据采集依赖 akshare 接口，请保持页面打开。完成后将自动跳转。</p>
+    <a href="/" class="back-link">← 返回首页</a>
+  </main>
+  <script>
+    const jobId = {{ job_id }};
+    const code = "{{ code }}";
+    const statusEl = document.getElementById("statusMsg");
+    const barEl = document.getElementById("progressBar");
+    let ticks = 0;
+
+    async function poll() {
+      try {
+        const res = await fetch("/api/jobs/" + jobId);
+        if (!res.ok) throw new Error("状态查询失败");
+        const data = await res.json();
+        statusEl.textContent = data.message || data.status;
+        ticks = Math.min(ticks + 8, 92);
+        if (data.status === "done") {
+          barEl.style.width = "100%";
+          statusEl.textContent = "报告就绪，正在打开…";
+          window.location.replace("/view/" + code);
+          return;
+        }
+        if (data.status === "error") {
+          barEl.style.width = "100%";
+          barEl.style.background = "#dc2626";
+          statusEl.textContent = data.error || "生成失败";
+          return;
+        }
+        barEl.style.width = ticks + "%";
+      } catch (err) {
+        statusEl.textContent = "网络异常，正在重试…";
+      }
+      setTimeout(poll, 2000);
+    }
+    poll();
+  </script>
+</body>
+</html>
