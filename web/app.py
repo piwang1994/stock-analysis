@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.collect_progress import CollectProgress, build_collect_manifest  # noqa: E402
 from src.data_fetcher import collect, detect_market, render_html  # noqa: E402
 
 WEB_DIR = Path(__file__).resolve().parent
@@ -92,6 +93,7 @@ class ReportJob:
     error: str | None = None
     created_at: float = field(default_factory=time.time)
     max_kline_years: int = DEFAULT_MAX_KLINE_YEARS
+    progress: CollectProgress | None = None
 
 
 _jobs: dict[str, ReportJob] = {}
@@ -107,6 +109,16 @@ def _set_job(job_id: str, **kwargs: Any) -> None:
             setattr(job, key, value)
 
 
+def _job_fetch_snapshot(job: ReportJob) -> dict[str, Any]:
+    if job.progress:
+        return job.progress.snapshot()
+    if job.status == "done" and job.html:
+        from src.collect_progress import CollectProgress as CP
+
+        return CP.cached_snapshot()
+    return {"phase": job.status, "total": 0, "completed": 0, "ok": 0, "fail": 0, "percent": 0, "tasks": []}
+
+
 def _run_report(job_id: str) -> None:
     with _jobs_lock:
         job = _jobs[job_id]
@@ -118,21 +130,50 @@ def _run_report(job_id: str) -> None:
         _set_job(job_id, status="done", message="已从缓存加载", html=cached)
         return
 
+    with _jobs_lock:
+        progress = _jobs[job_id].progress
+    if progress is None:
+        _, market = detect_market(code)
+        progress = CollectProgress()
+        progress.init_tasks(build_collect_manifest(years, market))
+        progress.add_task("render_html", "14. 生成报告", "HTML 渲染", "html")
+        with _jobs_lock:
+            _jobs[job_id].progress = progress
+
     try:
-        _set_job(job_id, status="running", message="正在采集行情与财务数据（约 2–5 分钟）…")
+        _set_job(job_id, status="running", message="正在采集数据…")
         detect_market(code)
-        data = collect(code, max_kline_years=years)
+        data = collect(code, max_kline_years=years, progress=progress)
+
+        progress.set_phase("render")
+        progress.task_start("render_html")
         _set_job(job_id, message="正在生成 HTML 报告…")
+        t0 = time.perf_counter()
         html_text = render_html(data)
+        progress.task_end("render_html", ok=True, rows=1, elapsed=time.perf_counter() - t0,
+                          message="完成")
+        progress.set_phase("done")
+
         write_cache(code, html_text)
         _set_job(job_id, status="done", message="报告已生成", html=html_text)
     except Exception as exc:
+        if progress:
+            progress.set_phase("error")
         _set_job(job_id, status="error", message="生成失败", error=str(exc))
 
 
 def start_job(code: str, max_kline_years: int = DEFAULT_MAX_KLINE_YEARS) -> str:
     cached = read_cache(code)
     job_id = str(uuid.uuid4())
+    prog: CollectProgress | None = None
+    if not cached:
+        try:
+            _, market = detect_market(code)
+            prog = CollectProgress()
+            prog.init_tasks(build_collect_manifest(max_kline_years, market))
+            prog.add_task("render_html", "14. 生成报告", "HTML 渲染", "html")
+        except ValueError:
+            prog = None
     with _jobs_lock:
         _jobs[job_id] = ReportJob(
             code=code,
@@ -140,6 +181,7 @@ def start_job(code: str, max_kline_years: int = DEFAULT_MAX_KLINE_YEARS) -> str:
             message="已从缓存加载" if cached else "排队中…",
             html=cached,
             max_kline_years=max_kline_years,
+            progress=prog,
         )
     if not cached:
         _executor.submit(_run_report, job_id)
@@ -213,6 +255,7 @@ async def api_job_status(job_id: str) -> dict[str, Any]:
         "code": job.code,
         "status": job.status,
         "message": job.message,
+        "fetch": _job_fetch_snapshot(job),
     }
     if job.status == "done":
         payload["view_url"] = f"/view/{job.code}"

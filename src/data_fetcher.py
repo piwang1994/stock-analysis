@@ -28,7 +28,10 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from src.collect_progress import CollectProgress
 
 import pandas as pd
 
@@ -104,6 +107,27 @@ def _safe_call(fn: Callable, *args, retries: int = 3, label: str = "", **kwargs)
             return None
 
 
+def _fetch(
+    progress: CollectProgress | None,
+    task_id: str,
+    label: str,
+    fn: Callable,
+    *args,
+    **kwargs,
+) -> pd.DataFrame | None:
+    """带进度回调的 akshare 请求。"""
+    if progress:
+        progress.task_start(task_id)
+    t0 = time.perf_counter()
+    df = _safe_call(fn, *args, label=label, **kwargs)
+    elapsed = time.perf_counter() - t0
+    rows = len(df) if df is not None and not df.empty else 0
+    ok = df is not None
+    if progress:
+        progress.task_end(task_id, ok=ok, rows=rows, elapsed=elapsed)
+    return df
+
+
 def _flatten_cell(v: Any) -> Any:
     """把单元格里偶发的 dict/list 类型压成易读字符串，避免前端显示 [object Object]。"""
     if isinstance(v, dict):
@@ -149,10 +173,20 @@ class StockReportData:
     errors: list[str] = field(default_factory=list)
 
 
-def collect(code: str, max_kline_years: int = 3) -> StockReportData:
+def collect(
+    code: str,
+    max_kline_years: int = 3,
+    progress: CollectProgress | None = None,
+) -> StockReportData:
     prefixed, market = detect_market(code)
     data = StockReportData(code=code, prefixed=prefixed, market=market,
                            ak_version=getattr(ak, "__version__", "未知"))
+
+    if progress:
+        from src.collect_progress import build_collect_manifest
+
+        progress.init_tasks(build_collect_manifest(max_kline_years, market))
+        progress.set_phase("collect")
 
     today = dt.date.today()
     last_trade = _last_trade_day(today + dt.timedelta(days=1))
@@ -164,11 +198,11 @@ def collect(code: str, max_kline_years: int = 3) -> StockReportData:
     month_ago_s = (today - dt.timedelta(days=40)).strftime("%Y%m%d")
 
     print("[1/13] 基础信息")
-    df = _safe_call(ak.stock_individual_basic_info_xq,
-                    symbol=prefixed.upper(), label="雪球-公司概况")
+    df = _fetch(progress, "basic_info", "雪球-公司概况",
+                ak.stock_individual_basic_info_xq, symbol=prefixed.upper())
     data.blocks["basic_info"] = _df_to_records(df)
 
-    df = _safe_call(ak.stock_zh_a_spot, label="新浪-全市场快照")
+    df = _fetch(progress, "spot", "新浪-全市场快照", ak.stock_zh_a_spot)
     if df is not None:
         # spot 表里 代码 列是 sh600519/sz000066 这种带前缀的形式
         df_self = df[df["代码"].astype(str) == prefixed]
@@ -178,67 +212,66 @@ def collect(code: str, max_kline_years: int = 3) -> StockReportData:
     else:
         data.blocks["spot"] = []
 
-    df = _safe_call(ak.stock_zh_a_gbjg_em,
-                    symbol=f"{code}.{market.upper()}", label="股本结构变动")
+    df = _fetch(progress, "share_structure", "股本结构变动",
+                ak.stock_zh_a_gbjg_em, symbol=f"{code}.{market.upper()}")
     data.blocks["share_structure"] = _df_to_records(df)
 
     print("[2/13] 主营业务构成")
-    df = _safe_call(ak.stock_zygc_em,
-                    symbol=f"{market.upper()}{code}", label="主营构成(东财·按行业/产品/地区)")
+    df = _fetch(progress, "zygc", "主营构成(东财·按行业/产品/地区)",
+                ak.stock_zygc_em, symbol=f"{market.upper()}{code}")
     data.blocks["zygc"] = _df_to_records(df)
 
     print("[3/13] 行情 K 线")
-    df = _safe_call(ak.stock_zh_a_daily, symbol=prefixed,
-                    start_date=kline_start, end_date=today_s, adjust="qfq",
-                    label=f"新浪-日K（{max_kline_years}年前复权）")
+    df = _fetch(progress, "kline_daily", f"新浪-日K（{max_kline_years}年前复权）",
+                ak.stock_zh_a_daily, symbol=prefixed,
+                start_date=kline_start, end_date=today_s, adjust="qfq")
     data.blocks["kline_daily"] = _df_to_records(df)
 
-    df = _safe_call(ak.stock_zh_a_minute, symbol=prefixed, period="1", adjust="",
-                    label="新浪-1分钟分时（最近5日）")
+    df = _fetch(progress, "kline_minute", "新浪-1分钟分时（最近5日）",
+                ak.stock_zh_a_minute, symbol=prefixed, period="1", adjust="")
     data.blocks["kline_minute"] = _df_to_records(df)
 
     print("[4/13] 资金流向")
-    df = _safe_call(ak.stock_individual_fund_flow, stock=code, market=market,
-                    label="个股资金流向(近100日)")
+    df = _fetch(progress, "fund_flow", "个股资金流向(近100日)",
+                ak.stock_individual_fund_flow, stock=code, market=market)
     data.blocks["fund_flow"] = _df_to_records(df)
 
     print("[5/13] 龙虎榜")
-    df = _safe_call(ak.stock_lhb_detail_em,
-                    start_date=month_ago_s, end_date=today_s,
-                    label="龙虎榜近30日全市场")
+    df = _fetch(progress, "lhb", "龙虎榜近30日全市场",
+                ak.stock_lhb_detail_em, start_date=month_ago_s, end_date=today_s)
     data.blocks["lhb"] = _df_to_records(_filter_by_code(df, code))
 
     print("[6/13] 财务核心指标")
-    df = _safe_call(ak.stock_financial_abstract, symbol=code,
-                    label="财务摘要（按报告期）")
+    df = _fetch(progress, "fin_abstract", "财务摘要（按报告期）",
+                ak.stock_financial_abstract, symbol=code)
     data.blocks["fin_abstract"] = _df_to_records(df)
 
-    df = _safe_call(ak.stock_financial_abstract_ths, symbol=code, indicator="按报告期",
-                    label="同花顺-关键指标")
+    df = _fetch(progress, "fin_indicator_ths", "同花顺-关键指标",
+                ak.stock_financial_abstract_ths, symbol=code, indicator="按报告期")
     data.blocks["fin_indicator_ths"] = _df_to_records(df)
 
     print("[7/13] 三大报表")
-    df = _safe_call(ak.stock_financial_report_sina, stock=prefixed, symbol="资产负债表",
-                    label="资产负债表")
+    df = _fetch(progress, "balance_sheet", "资产负债表",
+                ak.stock_financial_report_sina, stock=prefixed, symbol="资产负债表")
     data.blocks["balance_sheet"] = _df_to_records(df)
 
-    df = _safe_call(ak.stock_financial_report_sina, stock=prefixed, symbol="利润表",
-                    label="利润表")
+    df = _fetch(progress, "income_statement", "利润表",
+                ak.stock_financial_report_sina, stock=prefixed, symbol="利润表")
     data.blocks["income_statement"] = _df_to_records(df)
 
-    df = _safe_call(ak.stock_financial_report_sina, stock=prefixed, symbol="现金流量表",
-                    label="现金流量表")
+    df = _fetch(progress, "cashflow", "现金流量表",
+                ak.stock_financial_report_sina, stock=prefixed, symbol="现金流量表")
     data.blocks["cashflow"] = _df_to_records(df)
 
     print("[8/13] 业绩预告/快报（近 4 个报告期）")
     yj_periods = ["20240331", "20240630", "20240930", "20241231"]
     yjyg_all, yjkb_all = [], []
     for p in yj_periods:
-        df = _safe_call(ak.stock_yjyg_em, date=p, label=f"业绩预告 {p}")
+        df = _fetch(progress, f"yjyg_{p}", f"业绩预告 {p}", ak.stock_yjyg_em, date=p)
         rows = _filter_by_code(df, code)
         if not rows.empty:
             yjyg_all.extend(_df_to_records(rows))
-        df = _safe_call(ak.stock_yjkb_em, date=p, label=f"业绩快报 {p}")
+        df = _fetch(progress, f"yjkb_{p}", f"业绩快报 {p}", ak.stock_yjkb_em, date=p)
         rows = _filter_by_code(df, code)
         if not rows.empty:
             yjkb_all.extend(_df_to_records(rows))
@@ -246,67 +279,70 @@ def collect(code: str, max_kline_years: int = 3) -> StockReportData:
     data.blocks["yjkb"] = yjkb_all
 
     print("[9/13] 股东结构")
-    df = _safe_call(ak.stock_gdfx_top_10_em, symbol=prefixed, date="20231231",
-                    label="十大股东（2023Q4）")
+    df = _fetch(progress, "top10", "十大股东（2023Q4）",
+                ak.stock_gdfx_top_10_em, symbol=prefixed, date="20231231")
     data.blocks["top10"] = _df_to_records(df)
 
-    df = _safe_call(ak.stock_gdfx_free_top_10_em, symbol=prefixed, date="20231231",
-                    label="十大流通股东（2023Q4）")
+    df = _fetch(progress, "top10_free", "十大流通股东（2023Q4）",
+                ak.stock_gdfx_free_top_10_em, symbol=prefixed, date="20231231")
     data.blocks["top10_free"] = _df_to_records(df)
 
-    df = _safe_call(ak.stock_zh_a_gdhs_detail_em, symbol=code,
-                    label="股东户数变动")
+    df = _fetch(progress, "gdhs", "股东户数变动",
+                ak.stock_zh_a_gdhs_detail_em, symbol=code)
     data.blocks["gdhs"] = _df_to_records(df)
 
     if market == "sh":
-        df = _safe_call(ak.stock_share_hold_change_sse, symbol=code,
-                        label="高管持股变动（上交所）")
+        df = _fetch(progress, "share_hold_change", "高管持股变动（上交所）",
+                    ak.stock_share_hold_change_sse, symbol=code)
     else:
-        df = _safe_call(ak.stock_share_hold_change_szse, symbol=code,
-                        label="高管持股变动（深交所）")
+        df = _fetch(progress, "share_hold_change", "高管持股变动（深交所）",
+                    ak.stock_share_hold_change_szse, symbol=code)
     data.blocks["share_hold_change"] = _df_to_records(df)
 
     print("[10/13] 分红 / 解禁")
-    df = _safe_call(ak.stock_history_dividend_detail, symbol=code, indicator="分红",
-                    label="历史分红")
+    df = _fetch(progress, "dividend", "历史分红",
+                ak.stock_history_dividend_detail, symbol=code, indicator="分红")
     data.blocks["dividend"] = _df_to_records(df)
 
-    df = _safe_call(ak.stock_history_dividend_detail, symbol=code, indicator="配股",
-                    label="历史送转")
+    df = _fetch(progress, "share_alloc", "历史送转",
+                ak.stock_history_dividend_detail, symbol=code, indicator="配股")
     data.blocks["share_alloc"] = _df_to_records(df)
 
-    df = _safe_call(ak.stock_restricted_release_queue_em, symbol=code,
-                    label="限售解禁排队")
+    df = _fetch(progress, "release", "限售解禁排队",
+                ak.stock_restricted_release_queue_em, symbol=code)
     data.blocks["release"] = _df_to_records(df)
 
     print("[11/13] 公告 / 新闻 / 研报")
-    df = _safe_call(ak.stock_notice_report, symbol="全部", date=today_s,
-                    label=f"当日公告({today_s})")
+    df = _fetch(progress, "notice", f"当日公告({today_s})",
+                ak.stock_notice_report, symbol="全部", date=today_s)
     data.blocks["notice"] = _df_to_records(_filter_by_code(df, code))
 
-    df = _safe_call(ak.stock_news_em, symbol=code, label="个股新闻")
+    df = _fetch(progress, "news", "个股新闻", ak.stock_news_em, symbol=code)
     data.blocks["news"] = _df_to_records(df)
 
-    df = _safe_call(ak.stock_research_report_em, symbol=code, label="研究报告")
+    df = _fetch(progress, "research", "研究报告", ak.stock_research_report_em, symbol=code)
     data.blocks["research"] = _df_to_records(df)
 
     print("[12/13] 机构评级 / 基金持仓")
-    df = _safe_call(ak.stock_institute_recommend, symbol="股票综合评级",
-                    label="机构推荐评级（全市场）")
+    df = _fetch(progress, "recommend", "机构推荐评级（全市场）",
+                ak.stock_institute_recommend, symbol="股票综合评级")
     data.blocks["recommend"] = _df_to_records(_filter_by_code(df, code))
 
-    df = _safe_call(ak.stock_report_fund_hold_detail, symbol=code, date="20240331",
-                    label="基金持仓（2024Q1）")
+    df = _fetch(progress, "fund_hold", "基金持仓（2024Q1）",
+                ak.stock_report_fund_hold_detail, symbol=code, date="20240331")
     data.blocks["fund_hold"] = _df_to_records(df)
 
     print("[13/13] 融资融券")
     if market == "sh":
-        df = _safe_call(ak.stock_margin_detail_sse, date=last_trade_prev_s,
-                        label=f"上交所融资融券({last_trade_prev_s})")
+        df = _fetch(progress, "margin", f"上交所融资融券({last_trade_prev_s})",
+                    ak.stock_margin_detail_sse, date=last_trade_prev_s)
     else:
-        df = _safe_call(ak.stock_margin_detail_szse, date=last_trade_prev_s,
-                        label=f"深交所融资融券({last_trade_prev_s})")
+        df = _fetch(progress, "margin", f"深交所融资融券({last_trade_prev_s})",
+                    ak.stock_margin_detail_szse, date=last_trade_prev_s)
     data.blocks["margin"] = _df_to_records(_filter_by_code(df, code))
+
+    if progress:
+        progress.set_phase("collect_done")
 
     return data
 

@@ -7,13 +7,37 @@
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body class="page-loading">
-  <main class="shell loading-shell">
-    <div class="spinner" aria-hidden="true"></div>
-    <h1>正在生成报告</h1>
-    <p class="code-badge">{{ code }}</p>
+  <main class="shell loading-shell wide">
+    <header class="loading-header">
+      <div class="spinner" aria-hidden="true"></div>
+      <div>
+        <h1>正在生成报告</h1>
+        <p class="code-badge">{{ code }}</p>
+      </div>
+    </header>
+
     <p class="status-msg" id="statusMsg">排队中…</p>
-    <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
-    <p class="hint">数据采集依赖 akshare 接口，请保持页面打开。完成后将自动跳转。</p>
+    <div class="progress-track">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <p class="progress-stats" id="progressStats"></p>
+
+    <section class="fetch-panel">
+      <div class="fetch-panel-head">
+        <h2>数据采集明细</h2>
+        <span class="fetch-legend">
+          <span class="dot pending"></span>等待
+          <span class="dot running"></span>进行中
+          <span class="dot ok"></span>成功
+          <span class="dot fail"></span>失败
+        </span>
+      </div>
+      <ul class="fetch-list" id="fetchList">
+        <li class="fetch-item pending">加载任务列表…</li>
+      </ul>
+    </section>
+
+    <p class="hint">请保持页面打开，完成后将自动跳转至报告。</p>
     <a href="/" class="back-link">← 返回首页</a>
   </main>
   <script>
@@ -21,15 +45,88 @@
     const code = "{{ code }}";
     const statusEl = document.getElementById("statusMsg");
     const barEl = document.getElementById("progressBar");
-    let ticks = 0;
+    const statsEl = document.getElementById("progressStats");
+    const listEl = document.getElementById("fetchList");
+    const taskIndex = new Map();
+
+    const STATUS_LABEL = {
+      pending: "等待",
+      running: "进行中",
+      ok: "成功",
+      fail: "失败",
+    };
+
+    function renderTasks(fetch) {
+      if (!fetch || !fetch.tasks || !fetch.tasks.length) return;
+
+      if (taskIndex.size === 0) {
+        listEl.innerHTML = "";
+        fetch.tasks.forEach((t) => {
+          const li = document.createElement("li");
+          li.className = "fetch-item " + t.status;
+          li.dataset.id = t.id;
+          li.innerHTML = itemHtml(t);
+          listEl.appendChild(li);
+          taskIndex.set(t.id, li);
+        });
+        return;
+      }
+
+      fetch.tasks.forEach((t) => {
+        let li = taskIndex.get(t.id);
+        if (!li) {
+          li = document.createElement("li");
+          li.dataset.id = t.id;
+          listEl.appendChild(li);
+          taskIndex.set(t.id, li);
+        }
+        li.className = "fetch-item " + t.status;
+        li.innerHTML = itemHtml(t);
+      });
+
+      const running = listEl.querySelector(".fetch-item.running");
+      if (running) running.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+
+    function itemHtml(t) {
+      const meta = [];
+      if (t.rows != null && t.status !== "pending") meta.push(t.rows + " 行");
+      if (t.elapsed != null) meta.push(t.elapsed + "s");
+      if (t.message && t.status !== "pending") meta.push(t.message);
+      const metaStr = meta.length ? meta.join(" · ") : STATUS_LABEL[t.status] || "";
+      return (
+        '<div class="fetch-item-main">' +
+          '<span class="fetch-group">' + escapeHtml(t.group) + '</span>' +
+          '<span class="fetch-label">' + escapeHtml(t.label) + '</span>' +
+        '</div>' +
+        '<span class="fetch-status ' + t.status + '">' + (STATUS_LABEL[t.status] || t.status) + '</span>' +
+        (metaStr ? '<span class="fetch-meta">' + escapeHtml(metaStr) + '</span>' : "")
+      );
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
 
     async function poll() {
       try {
         const res = await fetch("/api/jobs/" + jobId);
         if (!res.ok) throw new Error("状态查询失败");
         const data = await res.json();
-        statusEl.textContent = data.message || data.status;
-        ticks = Math.min(ticks + 8, 92);
+        const fetch = data.fetch || {};
+
+        statusEl.textContent = data.message || fetch.current || data.status;
+        const pct = fetch.percent != null ? fetch.percent : 0;
+        barEl.style.width = Math.max(pct, 4) + "%";
+        statsEl.textContent = fetch.total
+          ? "已完成 " + (fetch.completed || 0) + " / " + fetch.total +
+            "（成功 " + (fetch.ok || 0) + "，失败 " + (fetch.fail || 0) + "）"
+          : "";
+
+        renderTasks(fetch);
+
         if (data.status === "done") {
           barEl.style.width = "100%";
           statusEl.textContent = "报告就绪，正在打开…";
@@ -42,11 +139,10 @@
           statusEl.textContent = data.error || "生成失败";
           return;
         }
-        barEl.style.width = ticks + "%";
       } catch (err) {
         statusEl.textContent = "网络异常，正在重试…";
       }
-      setTimeout(poll, 2000);
+      setTimeout(poll, 1000);
     }
     poll();
   </script>
